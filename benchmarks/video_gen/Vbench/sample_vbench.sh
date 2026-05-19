@@ -23,7 +23,7 @@ MAX_NUM_FRAMES=121
 MAX_LATENT_SIZE=64
 RESOLUTION="video_480p"
 
-MODEL_PATH="downloads/lance_3b_video"
+MODEL_PATH="downloads/Lance_3B_Video"
 VAL_DATASET_CONFIG_FILE="benchmarks/video_gen/Vbench/Vbench_recaption.jsonl"
 
 # ========================= 自动生成路径 =========================

@@ -39,7 +39,7 @@ bash sample_vbench.sh
 | `MAX_NUM_FRAMES` | 121 | 单个样本最大帧数 |
 | `MAX_LATENT_SIZE` | 64 | latent size 上限 |
 | `RESOLUTION` | `video_480p` | 数据集分辨率标签 |
-| `MODEL_PATH` | `downloads/lance_3b_video` | Lance checkpoint 路径 |
+| `MODEL_PATH` | `downloads/Lance_3B_Video` | Lance checkpoint 路径 |
 | `VAL_DATASET_CONFIG_FILE` | `benchmarks/video_gen/Vbench/Vbench_recaption.jsonl` | 评估数据路径 |
 | `CONFIG_JSON_PATH` | `""` | 可选训练配置 JSON |
 

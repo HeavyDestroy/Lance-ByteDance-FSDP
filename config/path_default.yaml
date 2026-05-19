@@ -3,8 +3,8 @@ base_dir: "downloads"
 
 # Lance 模型配置
 lance:
-  image: "${base_dir}/lance_3b"
-  video: "${base_dir}/lance_3b_video"
+  image: "${base_dir}/Lance_3B"
+  video: "${base_dir}/Lance_3B_Video"
 
 # Vision Transformer 配置
 vit:

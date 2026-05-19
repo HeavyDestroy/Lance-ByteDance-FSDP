@@ -35,7 +35,7 @@ bash benchmarks/image_gen/DPG/sample_DPG.sh
 | `USE_KVCACHE` | `true` | 是否启用 KV cache |
 | `NUM_GPUS` | 8 | GPU 数量 |
 | `VIDEO_HEIGHT`/`VIDEO_WIDTH` | 768 | 图像分辨率 |
-| `MODEL_PATH` | `downloads/lance_3b` | Lance checkpoint 路径 |
+| `MODEL_PATH` | `downloads/Lance_3B` | Lance checkpoint 路径 |
 | `VAL_DATASET_CONFIG_FILE` | `benchmarks/image_gen/DPG/DPG.jsonl` | 评估数据路径 |
 
 ## 修改方式

@@ -15,7 +15,7 @@ CFG_INTERVAL_START=0.4
 CFG_INTERVAL_END=1.0
 USE_KVCACHE=true
 
-MODEL_PATH="downloads/lance_3b"
+MODEL_PATH="downloads/Lance_3B"
 VAL_DATASET_CONFIG_FILE="benchmarks/image_gen/GEdit/GEdit_en.json"
 
 # ========================= 自动生成路径 =========================

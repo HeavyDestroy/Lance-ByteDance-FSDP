@@ -256,7 +256,7 @@ bash inference_lance.sh
 
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
-| `MODEL_PATH` | `"downloads/lance_3b"` | 下载后的 Lance 模型权重路径。 |
+| `MODEL_PATH` | `"downloads/Lance_3B"` | 下载后的 Lance 模型权重路径（如 `Lance_3B` 或 `Lance_3B_Video`）。 |
 | `NUM_GPUS` | `1` | 用于推理的 GPU 数量。 |
 | `VALIDATION_NUM_TIMESTEPS` | `30` | 去噪步数（例如 30 或 50）。 |
 | `VALIDATION_TIMESTEP_SHIFT` | `3.5` | Flow matching 调度中的 timestep shift 参数。 |

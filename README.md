@@ -256,7 +256,7 @@ You can configure the following hyperparameters at the top of the `inference_lan
 
 | Parameter | Default Value | Description |
 | --- | --- | --- |
-| `MODEL_PATH` | `"downloads/lance_3b"` | Path to the downloaded Lance model weights. |
+| `MODEL_PATH` | `"downloads/Lance_3B"` | Path to the downloaded Lance model weights  (`Lance_3B` or `Lance_3B_Video`). |
 | `NUM_GPUS` | `1` | Number of GPUs to use for inference. |
 | `VALIDATION_NUM_TIMESTEPS` | `30` | Number of denoising steps (e.g., 30 or 50). |
 | `VALIDATION_TIMESTEP_SHIFT` | `3.5` | Timestep shift parameter for flow matching scheduling. |

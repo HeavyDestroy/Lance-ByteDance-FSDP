@@ -47,7 +47,7 @@ RESULTS_ROOT = GRADIO_TMP_ROOT / "results"
 GLOBAL_RECORDS_FILE = GRADIO_TMP_ROOT / "generation_records.jsonl"
 RUN_RECORD_FILENAME = "generation_record.json"
 
-DEFAULT_MODEL_PATH = REPO_ROOT / "downloads" / "lance_3b_video"
+DEFAULT_MODEL_PATH = REPO_ROOT / "downloads" / "Lance_3B_Video"
 DEFAULT_VIT_TYPE = "qwen_2_5_vl_original"
 DEFAULT_TASK = "t2v"
 DEFAULT_TIMESTEPS = 30

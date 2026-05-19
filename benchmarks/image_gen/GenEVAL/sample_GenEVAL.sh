@@ -19,7 +19,7 @@ USE_KVCACHE=true
 VIDEO_HEIGHT=768
 VIDEO_WIDTH=768
 
-MODEL_PATH="downloads/lance_3b"
+MODEL_PATH="downloads/Lance_3B"
 VAL_DATASET_CONFIG_FILE="benchmarks/image_gen/GenEVAL/GenEVAL.jsonl"
 
 # ========================= 自动生成路径 =========================

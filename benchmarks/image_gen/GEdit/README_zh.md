@@ -34,7 +34,7 @@ bash benchmarks/image_gen/GEdit/sample_GEdit.sh
 | `CFG_INTERVAL_END` | 1.0 | CFG 区间终点 |
 | `USE_KVCACHE` | `true` | 是否启用 KV cache |
 | `NUM_GPUS` | 8 | GPU 数量 |
-| `MODEL_PATH` | `downloads/lance_3b` | Lance checkpoint 路径 |
+| `MODEL_PATH` | `downloads/Lance_3B` | Lance checkpoint 路径 |
 | `VAL_DATASET_CONFIG_FILE` | `benchmarks/image_gen/GEdit/GEdit_en.json` | 评估数据路径 |
 
 ## 修改方式

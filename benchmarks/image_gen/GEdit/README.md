@@ -34,7 +34,7 @@ Please follow `https://github.com/stepfun-ai/Step1X-Edit` to download the source
 | `CFG_INTERVAL_END` | 1.0 | End of the CFG interval. |
 | `USE_KVCACHE` | `true` | Whether to enable KV cache. |
 | `NUM_GPUS` | 8 | Number of GPUs. |
-| `MODEL_PATH` | `downloads/lance_3b` | Path to the Lance checkpoint. |
+| `MODEL_PATH` | `downloads/Lance_3B` | Path to the Lance checkpoint. |
 | `VAL_DATASET_CONFIG_FILE` | `benchmarks/image_gen/GEdit/GEdit_en.json` | Path to the evaluation data. |
 
 ## How To Modify

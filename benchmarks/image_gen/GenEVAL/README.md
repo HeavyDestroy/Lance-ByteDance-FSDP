@@ -35,7 +35,7 @@ Before running, edit the "Inference Parameters" section at the top of `benchmark
 | `USE_KVCACHE` | `true` | Whether to enable KV cache. |
 | `NUM_GPUS` | 8 | Number of GPUs. |
 | `VIDEO_HEIGHT`/`VIDEO_WIDTH` | 768 | Image resolution. |
-| `MODEL_PATH` | `downloads/lance_3b` | Path to the Lance checkpoint. |
+| `MODEL_PATH` | `downloads/Lance_3B` | Path to the Lance checkpoint. |
 | `VAL_DATASET_CONFIG_FILE` | `benchmarks/image_gen/GenEVAL/GenEVAL.jsonl` | Path to the evaluation data. |
 
 ## How To Modify

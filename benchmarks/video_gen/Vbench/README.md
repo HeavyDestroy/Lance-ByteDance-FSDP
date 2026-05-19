@@ -39,7 +39,7 @@ Before running, edit the "Inference Parameters" section at the top of `benchmark
 | `MAX_NUM_FRAMES` | 121 | Maximum number of frames per sample. |
 | `MAX_LATENT_SIZE` | 64 | Maximum latent size. |
 | `RESOLUTION` | `video_480p` | Dataset resolution tag. |
-| `MODEL_PATH` | `downloads/lance_3b_video` | Path to the Lance checkpoint. |
+| `MODEL_PATH` | `downloads/Lance_3B_Video` | Path to the Lance checkpoint. |
 | `VAL_DATASET_CONFIG_FILE` | `benchmarks/video_gen/Vbench/Vbench_recaption.jsonl` | Path to the evaluation data. |
 | `CONFIG_JSON_PATH` | `""` | Optional training configuration JSON. |
 
