@@ -106,6 +106,9 @@ TASK_V2T = "v2t"
 TASK_X2T = "x2t"
 TASK_X2T_VIDEO = "x2t_video"
 
+# System prompt for video understanding
+V2T_SYSTEM_PROMPT = "Please describe the content of the given video."
+
 TASK_CHOICES = [
     TASK_T2V,
     TASK_V2T,
@@ -428,42 +431,27 @@ def build_save_dir(task: str) -> Path:
 
 
 def create_request_json(task, prompt, input_video, question) -> Path:
-    """Write a one-sample prompt JSON file for the dataset loader."""
+    """Write a one-sample JSON file for the dataset loader.
+    Format matches Lance's expected input: {filename: prompt, ...} for t2v."""
     import yaml
-    data = {
-        TASK_T2V: {
-            "dataset_type": "jsonl",
-            "jsonl_files": [str(TMP_INPUT_DIR / "t2v_prompt.jsonl")],
-        },
-        TASK_V2T: {
-            "dataset_type": "jsonl",
-            "jsonl_files": [str(TMP_INPUT_DIR / "v2t_prompt.jsonl")],
-        },
-    }
-
-    os.makedirs(TMP_INPUT_DIR, exist_ok=True)
-    yaml_path = TMP_INPUT_DIR / f"{task}_config.yaml"
-
-    with open(yaml_path, "w") as f:
-        yaml.dump(data.get(task, data[TASK_T2V]), f, default_flow_style=False)
-
+    ensure_dirs()
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    prompt_file = TMP_INPUT_DIR / f"{task}_{timestamp}.json"
     if task == TASK_T2V:
-        jsonl_path = TMP_INPUT_DIR / "t2v_prompt.jsonl"
-        with open(jsonl_path, "w") as f:
-            json.dump({"prompt": prompt.strip()}, f)
-            f.write("\n")
+        payload = {"000000.mp4": prompt.strip()}
     elif task == TASK_V2T:
-        jsonl_path = TMP_INPUT_DIR / "v2t_prompt.jsonl"
-        entry = {"prompt": prompt.strip()}
-        if input_video:
-            entry["video_path"] = input_video
-        if question:
-            entry["question"] = question
-        with open(jsonl_path, "w") as f:
-            json.dump(entry, f)
-            f.write("\n")
-
-    return yaml_path
+        payload = {
+            "000000": {
+                "interleave_array": [input_video or "", [V2T_SYSTEM_PROMPT, question or "", ""]],
+                "element_dtype_array": ["video", "text"],
+                "istarget_in_interleave": [0, 1],
+            }
+        }
+    else:
+        raise ValueError(f"Unsupported task: {task}")
+    with prompt_file.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    return prompt_file
 
 
 def save_generation_record(record: dict, save_dir: Path):
