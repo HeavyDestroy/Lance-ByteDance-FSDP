@@ -5,9 +5,10 @@ cd "$SCRIPT_DIR"
 source "$SCRIPT_DIR/benchmarks/sample_env.sh"
 
 # ========================= Inference Parameters =========================
-NUM_GPUS=1
+NUM_GPUS=2
 
 TASK_NAME=x2t_image # t2i | image_edit | t2v | video_edit | x2t_image | x2t_video
+USE_IMAGE_MODEL=true  # set true for image tasks, false for video tasks
 
 VALIDATION_NUM_TIMESTEPS=30 # 50
 VALIDATION_TIMESTEP_SHIFT=3.5
@@ -18,10 +19,23 @@ USE_KVCACHE=true
 NUM_FRAMES=50             # max: 121 frames, unused for image tasks
 VIDEO_HEIGHT=768          # unused for editing
 VIDEO_WIDTH=768           # unused for editing
-RESOLUTION="video_480p"   # image_768res | video_480p
 TEXT_TEMPLATE=true
 
-MODEL_PATH="downloads/lance_3b_video"
+# Auto-select model path based on task type
+case "$TASK_NAME" in
+    t2i|image_edit|x2t_image)
+        MODEL_PATH="downloads/lance_3b"
+        RESOLUTION="image_768res"
+        VISUAL_GEN=true
+        VISUAL_UND=true
+        ;;
+    t2v|video_edit|x2t_video)
+        MODEL_PATH="downloads/lance_3b_video"
+        RESOLUTION="video_480p"
+        VISUAL_GEN=true
+        VISUAL_UND=true
+        ;;
+esac
 
 # ========================= Auto-generated Paths =========================
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
@@ -63,13 +77,14 @@ echo "================================================"
 echo ""
 
 # ============================== Run Inference ==============================
-accelerate launch \
-    --num_machines          $NUM_MACHINES \
-    --num_processes         $TOTAL_RANK \
-    --machine_rank          $MACHINE_RANK \
-    --main_process_ip       $MAIN_PROCESS_IP \
-    --main_process_port     $MAIN_PROCESS_PORT \
-    --mixed_precision       bf16 \
+PYTHON_VENV="$HOME/qwen32b-training-data/.venv"
+TORCHRUN="$PYTHON_VENV/bin/torchrun"
+if [ ! -f "$TORCHRUN" ]; then
+    TORCHRUN="torchrun"
+fi
+
+$TORCHRUN \
+    --nproc_per_node=$NUM_GPUS \
     inference_lance.py \
     --model_path            "$MODEL_PATH" \
     --vit_type              qwen_2_5_vl_original \
@@ -83,8 +98,8 @@ accelerate launch \
     --max_num_frames        121 \
     --max_latent_size       64 \
     --latent_patch_size     1 1 1 \
-    --visual_und            true \
-    --visual_gen            true \
+    --visual_und            $VISUAL_UND \
+    --visual_gen            $VISUAL_GEN \
     --vae_model_type        wan \
     --apply_qwen_2_5_vl_pos_emb true \
     --apply_chat_template   false \

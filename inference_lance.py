@@ -259,7 +259,8 @@ def validate_on_fixed_batch(
     save_path_gt: str = "",
 ):
     val_data = val_data_cpu.cuda(device).to_dict()
-    fsdp_model = fsdp_model.to(device=device, dtype=torch.bfloat16)
+    # Model already dispatched in bf16 — skip redundant .to() call
+    # fsdp_model = fsdp_model.to(device=device, dtype=torch.bfloat16)
 
     with torch.no_grad(), torch.amp.autocast("cuda", enabled=True, dtype=torch.bfloat16):
         # Compute padded_latent.
@@ -495,9 +496,9 @@ def main():
         training_args=training_args,
     )
     stage_start = time.perf_counter()
-    log_rank0(f"[startup] Moving Lance model to GPU {DEVICE}")
-    model = model.to(DEVICE)
-    log_stage("Lance model move to GPU", stage_start)
+    log_rank0(f"[startup] Converting model to bf16 (CPU)")
+    model.to(dtype=torch.bfloat16)
+    log_stage("bf16 conversion", stage_start)
 
     # Setup tokenizer for model:
     stage_start = time.perf_counter()
@@ -538,10 +539,55 @@ def main():
     else: # HACK!!!
         assert model.language_model.get_input_embeddings().weight.data.data_ptr() != model.language_model.get_output_embeddings().weight.data.data_ptr(), 'tie_word_embeddings conflict'
 
-    model = model.to(device=DEVICE, dtype=torch.bfloat16)
+
     model.eval()
+
+    # ===================== FSDP + GPU placement =====================
+    stage_start = time.perf_counter()
+    if WORLD_SIZE > 1:
+        log_rank0(f"[startup] FSDP-wrapping each decoder layer across {WORLD_SIZE} GPUs (NCCL)")
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        from torch.distributed.fsdp import ShardingStrategy
+
+        lm = model.language_model
+
+        # Move non-decoder-layer components to GPU (stay full, accessed outside FSDP)
+        lm.lm_head = lm.lm_head.to(device=f"cuda:{DEVICE}", dtype=torch.bfloat16)
+        lm.model.embed_tokens = lm.model.embed_tokens.to(device=f"cuda:{DEVICE}", dtype=torch.bfloat16)
+        lm.model.norm = lm.model.norm.to(device=f"cuda:{DEVICE}", dtype=torch.bfloat16)
+        if hasattr(lm.model, 'norm_moe_gen') and lm.model.norm_moe_gen is not None:
+            lm.model.norm_moe_gen = lm.model.norm_moe_gen.to(device=f"cuda:{DEVICE}", dtype=torch.bfloat16)
+        if hasattr(lm.model, 'rotary_emb') and lm.model.rotary_emb is not None:
+            lm.model.rotary_emb = lm.model.rotary_emb.to(device=f"cuda:{DEVICE}")
+
+        # Wrap each decoder layer individually with FSDP FULL_SHARD
+        # Each layer ~700MB bf16 → ~350MB shard per GPU → fits easily
+        for i in range(len(lm.model.layers)):
+            lm.model.layers[i] = FSDP(
+                lm.model.layers[i],
+                sharding_strategy=ShardingStrategy.FULL_SHARD,
+                device_id=torch.cuda.current_device(),
+            )
+
+        log_rank0(f"[startup] {len(lm.model.layers)} decoder layers FSDP-wrapped with FULL_SHARD")
+
+    # Move all non-FSDP Lance components to this rank's GPU
+    if hasattr(model, 'vit_model') and model.vit_model is not None:
+        model.vit_model = model.vit_model.to(device=f"cuda:{DEVICE}", dtype=torch.bfloat16)
+    if hasattr(model, 'time_embedder'):
+        model.time_embedder = model.time_embedder.to(device=f"cuda:{DEVICE}")
+    if hasattr(model, 'connector') and model.connector is not None:
+        model.connector = model.connector.to(device=f"cuda:{DEVICE}", dtype=torch.bfloat16)
+    for attr in ['vae2llm', 'llm2vae', 'latent_pos_embed']:
+        if hasattr(model, attr):
+            getattr(model, attr).to(device=f"cuda:{DEVICE}")
+
+    log_stage("model GPU placement", stage_start)
+
+    # VAE: each rank to its own GPU
     if vae_model is not None and hasattr(vae_model, "eval"):
         vae_model.eval()
+        vae_model.to(device=f"cuda:{DEVICE}")
 
     # Setup packed dataloader
     stage_start = time.perf_counter()

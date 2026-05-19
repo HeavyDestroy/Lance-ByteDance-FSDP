@@ -584,8 +584,8 @@ class Qwen2_5_VLRotaryEmbedding(nn.Module):
         # else:
         #     self.rope_type = "default"
 
-        # HACK: 强制设置为default
-        self.rope_type = "default"
+        # HACK: 强制设置为linear (transformers 5.x removed "default" key from ROPE_INIT_FUNCTIONS)
+        self.rope_type = "linear"
 
         self.max_seq_len_cached = config.max_position_embeddings
         self.original_max_seq_len = config.max_position_embeddings
