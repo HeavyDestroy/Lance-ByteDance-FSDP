@@ -338,6 +338,17 @@ def init_fsdp_model(
     # VAE stays on CPU — moved on demand for encode/decode
     if hasattr(vae_model, "eval"):
         vae_model.eval()
+    # Move VAE's scale tensor to CPU too. Wan2_2_VAE is a plain object (not nn.Module),
+    # so calling .to("cpu") on the inner model doesn't propagate to its .scale attribute.
+    # Without this, CPU decode fails with "Expected all tensors to be on the same device".
+    if hasattr(vae_model, 'vae') and hasattr(vae_model.vae, 'scale'):
+        _s = vae_model.vae.scale
+        if isinstance(_s, torch.Tensor):
+            vae_model.vae.scale = _s.cpu()
+        elif isinstance(_s, (list, tuple)):
+            vae_model.vae.scale = type(_s)(
+                x.cpu() if isinstance(x, torch.Tensor) else x for x in _s
+            )
     log_rank0(f"[init] VAE kept on CPU (moved to GPU on demand)")
 
     # Clear stale CUDA allocator cache after init
@@ -554,7 +565,8 @@ def build_status_markdown() -> str:
 def update_task_ui(task: str):
     """Return visibility updates for all UI components based on task."""
     task = (task or DEFAULT_TASK).strip().lower()
-    # Order: prompt, input_video, input_image, question, height, width, num_frames, output_text
+    # Order: prompt, input_video, input_image, question, height, width, num_frames,
+    #        output_text, output_video, output_image
     if task == TASK_T2V:
         return (
             gr.update(label="Prompt", placeholder="Describe the video...", visible=True),
@@ -565,6 +577,8 @@ def update_task_ui(task: str):
             gr.update(visible=True),
             gr.update(visible=True),
             gr.update(value=""),
+            gr.update(visible=True),   # output_video
+            gr.update(visible=False),  # output_image
         )
     if task == TASK_T2I:
         return (
@@ -576,6 +590,8 @@ def update_task_ui(task: str):
             gr.update(visible=True),
             gr.update(visible=False, value=1),
             gr.update(value=""),
+            gr.update(visible=False),  # output_video
+            gr.update(visible=True),   # output_image
         )
     if task == TASK_IMAGE_EDIT:
         return (
@@ -587,6 +603,8 @@ def update_task_ui(task: str):
             gr.update(visible=True),
             gr.update(visible=False, value=1),
             gr.update(value=""),
+            gr.update(visible=False),  # output_video
+            gr.update(visible=True),   # output_image
         )
     if task == TASK_V2T or task == TASK_X2T_VIDEO:
         return (
@@ -597,7 +615,9 @@ def update_task_ui(task: str):
             gr.update(visible=False),
             gr.update(visible=False),
             gr.update(visible=False),
-            gr.update(value=""),
+            gr.update(visible=True),
+            gr.update(visible=False),  # output_video
+            gr.update(visible=False),  # output_image
         )
     if task == TASK_X2T_IMAGE:
         return (
@@ -608,11 +628,13 @@ def update_task_ui(task: str):
             gr.update(visible=False),
             gr.update(visible=False),
             gr.update(visible=False),
-            gr.update(value=""),
+            gr.update(visible=True),
+            gr.update(visible=False),  # output_video
+            gr.update(visible=False),  # output_image
         )
-    # fallback
+    # Default: same as t2v
     return (
-        gr.update(label="Prompt", placeholder="Describe...", visible=True),
+        gr.update(visible=True),
         gr.update(visible=False, value=None),
         gr.update(visible=False, value=None),
         gr.update(visible=False, value=""),
@@ -620,6 +642,8 @@ def update_task_ui(task: str):
         gr.update(visible=True),
         gr.update(visible=True),
         gr.update(value=""),
+        gr.update(visible=True),   # output_video
+        gr.update(visible=False),  # output_image
     )
 
 
@@ -677,7 +701,8 @@ def build_demo() -> gr.Blocks:
         task.change(
             fn=update_task_ui,
             inputs=[task],
-            outputs=[prompt, input_video, input_image, question, height, width, num_frames, output_text],
+            outputs=[prompt, input_video, input_image, question, height, width, num_frames,
+                     output_text, output_video, output_image],
         )
 
         run_button.click(

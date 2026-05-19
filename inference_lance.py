@@ -347,6 +347,17 @@ def validate_on_fixed_batch(
                     # ── CPU decode path ──
                     # Keep VAE on CPU, move latents to CPU, decode there, move result back.
                     # This avoids adding VAE params (~1-2 GB) + conv3d scratch on an already-full GPU.
+                    # Safety net: ensure scale tensor(s) are on CPU (Wan2_2_VAE wrapper is a plain
+                    # object and may have created scale on CUDA at init).
+                    _vae_scale = getattr(vae_model.vae, 'scale', None)
+                    if _vae_scale is not None:
+                        if isinstance(_vae_scale, torch.Tensor):
+                            vae_model.vae.scale = _vae_scale.cpu()
+                        elif isinstance(_vae_scale, (list, tuple)):
+                            vae_model.vae.scale = type(_vae_scale)(
+                                s.cpu() if isinstance(s, torch.Tensor) else s
+                                for s in _vae_scale
+                            )
                     for latent_ in target_latents:
                         u = latent_.unsqueeze(0).float().cpu()                         # [1,t,h,w,48]
                         u = rearrange(u, "b ... c -> b c ...")                         # [1,48,t,h,w]
