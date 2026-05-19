@@ -196,7 +196,7 @@ def init_fsdp_model(
     # ── Lance model ──
     log_rank0(f"[init] Loading LLM config: {model_path / 'llm_config.json'}")
     stage_start = time.perf_counter()
-    llm_config = Qwen2Config.from_pretrained(str(model_path))
+    llm_config: Qwen2Config = Qwen2Config.from_json_file(str(Path(model_path) / "llm_config.json"))
     lance_config = LanceConfig(
         llm_config=llm_config,
         vae_config=vae_config,
