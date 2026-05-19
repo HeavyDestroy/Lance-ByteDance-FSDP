@@ -23,6 +23,7 @@ os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 
 import os.path as osp
 from copy import deepcopy
+from einops import rearrange
 import json
 from typing import Tuple, cast, Optional
 import torch
@@ -264,13 +265,19 @@ def validate_on_fixed_batch(
 
     with torch.no_grad(), torch.amp.autocast("cuda", enabled=True, dtype=torch.bfloat16):
         # Compute padded_latent — move VAE to GPU on demand, then back to CPU.
-        _vae_was_on_cpu = vae_model is not None and next(vae_model.parameters()).device.type == "cpu"
+        # WanVideoVAE/Wan2_2_VAE are plain objects (not nn.Module).
+        # Chain: WanVideoVAE -> .vae -> Wan2_2_VAE -> .model -> actual nn.Module
+        _vae_actual = vae_model
+        if _vae_actual is not None:
+            _vae_actual = getattr(_vae_actual, 'vae', _vae_actual)
+            _vae_actual = getattr(_vae_actual, 'model', _vae_actual)
+        _vae_was_on_cpu = _vae_actual is not None and next(_vae_actual.parameters()).device.type == "cpu"
         if "padded_videos" in val_data.keys():
-            if _vae_was_on_cpu and vae_model is not None:
-                vae_model.to(device=f"cuda:{device}")
+            if _vae_was_on_cpu and _vae_actual is not None:
+                _vae_actual.to(device=f"cuda:{device}")
             val_data["padded_latent"] = make_padded_latent(val_data["padded_videos"], val_data["vae_data_mode"], vae_model)
-            if _vae_was_on_cpu and vae_model is not None:
-                vae_model.to(device="cpu")
+            if _vae_was_on_cpu and _vae_actual is not None:
+                _vae_actual.to(device="cpu")
                 torch.cuda.empty_cache()
 
         # -------------------- Generation branch --------------------
@@ -327,14 +334,33 @@ def validate_on_fixed_batch(
                     target_latents = latent
 
                 v_list = []
-                # Move VAE to GPU for decode (it may be on CPU to save memory)
-                _vae_on_cpu_decode = vae_model is not None and next(vae_model.parameters()).device.type == "cpu"
-                if _vae_on_cpu_decode:
-                    vae_model.to(device=f"cuda:{device}")
-                for latent_ in target_latents:
-                    v_list.append(vae_model.vae_decode([latent_])[0])
-                if _vae_on_cpu_decode:
-                    vae_model.to(device="cpu")
+                # VAE may be on CPU to save VRAM. If so, decode on CPU instead of
+                # moving VAE params to GPU and blowing the memory budget.
+                # Chain: WanVideoVAE -> .vae -> Wan2_2_VAE -> .model -> actual nn.Module
+                _vae_decode_actual = vae_model
+                if _vae_decode_actual is not None:
+                    _vae_decode_actual = getattr(_vae_decode_actual, 'vae', _vae_decode_actual)
+                    _vae_decode_actual = getattr(_vae_decode_actual, 'model', _vae_decode_actual)
+                _vae_on_cpu = _vae_decode_actual is not None and next(_vae_decode_actual.parameters()).device.type == "cpu"
+
+                if _vae_on_cpu:
+                    # ── CPU decode path ──
+                    # Keep VAE on CPU, move latents to CPU, decode there, move result back.
+                    # This avoids adding VAE params (~1-2 GB) + conv3d scratch on an already-full GPU.
+                    for latent_ in target_latents:
+                        u = latent_.unsqueeze(0).float().cpu()                         # [1,t,h,w,48]
+                        u = rearrange(u, "b ... c -> b c ...")                         # [1,48,t,h,w]
+                        x_hat = vae_model.vae.decode(u)                                # runs on CPU, returns [1,3,T,H,W] float
+                        v_list.append(x_hat.squeeze(0).to(device=f"cuda:{device}"))    # [3,T,H,W] → GPU
+                    del u, x_hat
+                else:
+                    # ── Original GPU decode path ──
+                    if _vae_decode_actual is not None:
+                        _vae_decode_actual.to(device=f"cuda:{device}")
+                    for latent_ in target_latents:
+                        v_list.append(vae_model.vae_decode([latent_])[0])
+                    if _vae_decode_actual is not None:
+                        _vae_decode_actual.to(device="cpu")
                     torch.cuda.empty_cache()
 
                 save_item_name = f"{index:06d}" if isinstance(index, int) else index
