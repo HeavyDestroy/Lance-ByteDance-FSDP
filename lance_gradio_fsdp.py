@@ -52,6 +52,9 @@ from inference_lance import (
     PROMPT_JSON_FILENAME,
     GENERATION_TASKS,
     UNDERSTANDING_TASKS,
+    TASK_T2I,
+    TASK_IMAGE_EDIT,
+    TASK_X2T_IMAGE,
     apply_inference_defaults,
     clean_memory,
     init_from_model_path_if_needed,
@@ -106,12 +109,16 @@ TASK_V2T = "v2t"
 TASK_X2T = "x2t"
 TASK_X2T_VIDEO = "x2t_video"
 
-# System prompt for video understanding
+# System prompts
 V2T_SYSTEM_PROMPT = "Please describe the content of the given video."
+I2T_SYSTEM_PROMPT = "Please describe the content of the given image."
 
 TASK_CHOICES = [
     TASK_T2V,
+    TASK_T2I,
+    TASK_IMAGE_EDIT,
     TASK_V2T,
+    TASK_X2T_IMAGE,
 ]
 VIDEO_RESOLUTION_CHOICES = [
     "video_480p",
@@ -414,8 +421,16 @@ def normalize_task(task: str) -> str:
     task = (task or "").strip().lower()
     if task in ("t2v", "text2video", "text-to-video"):
         return TASK_T2V
+    if task in ("t2i", "text2image", "text-to-image"):
+        return TASK_T2I
+    if task in ("image_edit", "i2i", "img2img", "image-to-image"):
+        return TASK_IMAGE_EDIT
     if task in ("v2t", "video2text", "video-to-text"):
         return TASK_V2T
+    if task in ("x2t_image", "i2t", "image2text", "image-to-text"):
+        return TASK_X2T_IMAGE
+    if task in ("x2t_video", "vqa"):
+        return TASK_X2T_VIDEO
     return TASK_T2V
 
 
@@ -430,16 +445,40 @@ def build_save_dir(task: str) -> Path:
     return RESULTS_ROOT / f"{task}_{timestamp}"
 
 
-def create_request_json(task, prompt, input_video, question) -> Path:
+def create_request_json(task, prompt, input_video, input_image, question) -> Path:
     """Write a one-sample JSON file for the dataset loader.
-    Format matches Lance's expected input: {filename: prompt, ...} for t2v."""
+    Format matches Lance's expected input: {filename: prompt, ...} for t2v/t2i,
+    or interleave dict for understanding/editing tasks."""
     import yaml
     ensure_dirs()
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     prompt_file = TMP_INPUT_DIR / f"{task}_{timestamp}.json"
     if task == TASK_T2V:
         payload = {"000000.mp4": prompt.strip()}
-    elif task == TASK_V2T:
+    elif task == TASK_T2I:
+        payload = {"000000.png": prompt.strip()}
+    elif task == TASK_IMAGE_EDIT:
+        # image_edit: input image + text instruction → edited image
+        if not input_image:
+            raise ValueError("Input image required for image_edit")
+        payload = {
+            "000000": {
+                "interleave_array": [prompt.strip(), input_image, input_image],
+                "element_dtype_array": ["text", "image", "image"],
+                "istarget_in_interleave": [0, 0, 1],
+            }
+        }
+    elif task == TASK_X2T_IMAGE:
+        if not input_image:
+            raise ValueError("Input image required for x2t_image")
+        payload = {
+            "000000": {
+                "interleave_array": [input_image, [I2T_SYSTEM_PROMPT, question or "", ""]],
+                "element_dtype_array": ["image", "text"],
+                "istarget_in_interleave": [0, 1],
+            }
+        }
+    elif task == TASK_V2T or task == TASK_X2T_VIDEO:
         payload = {
             "000000": {
                 "interleave_array": [input_video or "", [V2T_SYSTEM_PROMPT, question or "", ""]],
@@ -483,14 +522,14 @@ def extract_text_result(save_dir: Path) -> str:
 
 # ─── Gradio UI (rank 0 only) ──────────────────────────────────────────
 def run_task_handler(
-    task, prompt, input_video, question, height, width, num_frames,
+    task, prompt, input_video, input_image, question, height, width, num_frames,
     seed, resolution, validation_num_timesteps, validation_timestep_shift, cfg_text_scale,
 ):
     """Called by Gradio on rank 0 in a background thread."""
     global _result_container, _result_event
 
     request_data = dict(
-        task=task, prompt=prompt, input_video=input_video, question=question,
+        task=task, prompt=prompt, input_video=input_video, input_image=input_image, question=question,
         height=height, width=width, num_frames=num_frames, seed=seed,
         resolution=resolution, validation_num_timesteps=validation_num_timesteps,
         validation_timestep_shift=validation_timestep_shift,
@@ -501,7 +540,7 @@ def run_task_handler(
     _request_queue.put(request_data)
     _result_event.wait()
     _result_event.clear()
-    return _result_container.pop("result", (None, "", "No result", ""))
+    return _result_container.pop("result", (None, None, "", "No result", ""))
 
 
 def build_status_markdown() -> str:
@@ -513,10 +552,13 @@ def build_status_markdown() -> str:
 
 
 def update_task_ui(task: str):
+    """Return visibility updates for all UI components based on task."""
     task = (task or DEFAULT_TASK).strip().lower()
+    # Order: prompt, input_video, input_image, question, height, width, num_frames, output_text
     if task == TASK_T2V:
         return (
             gr.update(label="Prompt", placeholder="Describe the video...", visible=True),
+            gr.update(visible=False, value=None),
             gr.update(visible=False, value=None),
             gr.update(visible=False, value=""),
             gr.update(visible=True),
@@ -524,23 +566,81 @@ def update_task_ui(task: str):
             gr.update(visible=True),
             gr.update(value=""),
         )
+    if task == TASK_T2I:
+        return (
+            gr.update(label="Prompt", placeholder="Describe the image...", visible=True),
+            gr.update(visible=False, value=None),
+            gr.update(visible=False, value=None),
+            gr.update(visible=False, value=""),
+            gr.update(visible=True),
+            gr.update(visible=True),
+            gr.update(visible=False, value=1),
+            gr.update(value=""),
+        )
+    if task == TASK_IMAGE_EDIT:
+        return (
+            gr.update(label="Edit Instruction", placeholder="Describe the edit...", visible=True),
+            gr.update(visible=False, value=None),
+            gr.update(label="Input Image", visible=True),
+            gr.update(visible=False, value=""),
+            gr.update(visible=True),
+            gr.update(visible=True),
+            gr.update(visible=False, value=1),
+            gr.update(value=""),
+        )
+    if task == TASK_V2T or task == TASK_X2T_VIDEO:
+        return (
+            gr.update(visible=False, value=""),
+            gr.update(label="Input Video", visible=True),
+            gr.update(visible=False, value=None),
+            gr.update(label="Question", placeholder="Ask about the video...", visible=True),
+            gr.update(visible=False),
+            gr.update(visible=False),
+            gr.update(visible=False),
+            gr.update(value=""),
+        )
+    if task == TASK_X2T_IMAGE:
+        return (
+            gr.update(visible=False, value=""),
+            gr.update(visible=False, value=None),
+            gr.update(label="Input Image", visible=True),
+            gr.update(label="Question", placeholder="Ask about the image...", visible=True),
+            gr.update(visible=False),
+            gr.update(visible=False),
+            gr.update(visible=False),
+            gr.update(value=""),
+        )
+    # fallback
     return (
+        gr.update(label="Prompt", placeholder="Describe...", visible=True),
+        gr.update(visible=False, value=None),
+        gr.update(visible=False, value=None),
         gr.update(visible=False, value=""),
-        gr.update(label="Input Video", visible=True),
-        gr.update(label="Question", placeholder="Ask about the video...", visible=True),
-        gr.update(visible=False),
-        gr.update(visible=False),
-        gr.update(visible=False),
+        gr.update(visible=True),
+        gr.update(visible=True),
+        gr.update(visible=True),
         gr.update(value=""),
     )
 
 
+def clear_cache_handler():
+    """Clear CUDA cache and temp dirs, then return status."""
+    import shutil
+    torch.cuda.empty_cache()
+    for d in [TMP_INPUT_DIR, RESULTS_ROOT]:
+        if d.exists():
+            shutil.rmtree(str(d))
+        d.mkdir(parents=True, exist_ok=True)
+    log_rank0("[cache] Cleared CUDA cache and temp dirs")
+    return "Cache cleared."
+
+
 def build_demo() -> gr.Blocks:
-    with gr.Blocks(title="Lance T2V/V2T (FSDP Dual-GPU)") as demo:
+    with gr.Blocks(title="Lance FSDP Multi-Task") as demo:
         gr.Markdown(
-            "# Lance T2V/V2T — FSDP Dual-GPU Demo\n\n"
+            "# Lance — FSDP Multi-Task Demo\n\n"
             f"Powered by FSDP + NCCL across {WORLD_SIZE} GPUs. "
-            "Supports `t2v` (text-to-video) and `v2t` (video-to-text)."
+            "Supports `t2v`, `t2i`, `image_edit`, `v2t`, `x2t_image`."
         )
         gr.Markdown(build_status_markdown())
 
@@ -549,6 +649,7 @@ def build_demo() -> gr.Blocks:
                 task = gr.Dropdown(label="Task", choices=TASK_CHOICES, value=DEFAULT_TASK)
                 prompt = gr.Textbox(label="Prompt", lines=6, placeholder="Describe the video to generate...")
                 input_video = gr.Video(label="Input Video", visible=False)
+                input_image = gr.Image(label="Input Image", type="filepath", visible=False)
                 question = gr.Textbox(label="Question", lines=3, placeholder="Ask about the video...", visible=False)
                 with gr.Row():
                     height = gr.Slider(minimum=192, maximum=1024, step=16, value=DEFAULT_HEIGHT, label="Height")
@@ -562,10 +663,13 @@ def build_demo() -> gr.Blocks:
                     validation_timestep_shift = gr.Number(label="Timestep Shift", value=DEFAULT_TIMESTEP_SHIFT)
                     cfg_text_scale = gr.Number(label="CFG Scale", value=DEFAULT_CFG_TEXT_SCALE)
 
-                run_button = gr.Button("Run", variant="primary")
+                with gr.Row():
+                    run_button = gr.Button("Run", variant="primary")
+                    clear_cache_btn = gr.Button("Clear Cache", variant="secondary")
 
             with gr.Column(scale=1):
-                output_video = gr.Video(label="Video Result")
+                output_video = gr.Video(label="Video Result", visible=True)
+                output_image = gr.Image(label="Image Result", type="filepath", visible=False)
                 output_text = gr.Textbox(label="Text Result", lines=8)
                 status = gr.Markdown("Ready.")
                 logs = gr.Textbox(label="Logs", lines=22, max_lines=30)
@@ -573,17 +677,23 @@ def build_demo() -> gr.Blocks:
         task.change(
             fn=update_task_ui,
             inputs=[task],
-            outputs=[prompt, input_video, question, height, width, num_frames, output_text],
+            outputs=[prompt, input_video, input_image, question, height, width, num_frames, output_text],
         )
 
         run_button.click(
             fn=run_task_handler,
             inputs=[
-                task, prompt, input_video, question, height, width, num_frames,
+                task, prompt, input_video, input_image, question, height, width, num_frames,
                 seed, resolution, validation_num_timesteps,
                 validation_timestep_shift, cfg_text_scale,
             ],
-            outputs=[output_video, output_text, status, logs],
+            outputs=[output_video, output_image, output_text, status, logs],
+        )
+
+        clear_cache_btn.click(
+            fn=clear_cache_handler,
+            inputs=[],
+            outputs=[status],
         )
 
     return demo
@@ -664,7 +774,7 @@ def main():
             internal_task = normalize_task(req["task"])
             prompt_file = create_request_json(
                 internal_task, req.get("prompt", ""),
-                req.get("input_video", ""), req.get("question", ""),
+                req.get("input_video", ""), req.get("input_image", ""), req.get("question", ""),
             )
             save_dir = build_save_dir(internal_task)
             save_dir.mkdir(parents=True, exist_ok=True)
@@ -773,8 +883,9 @@ def main():
                         )
 
                 if IS_RANK0:
-                    video_path = find_generated_video(save_dir) if internal_task == TASK_T2V else None
-                    text_result = extract_text_result(save_dir) if internal_task == TASK_X2T_VIDEO else ""
+                    video_path = find_generated_video(save_dir) if internal_task in (TASK_T2V,) else None
+                    image_path = find_generated_video(save_dir) if internal_task in (TASK_T2I, TASK_IMAGE_EDIT) else None
+                    text_result = extract_text_result(save_dir) if internal_task in (TASK_X2T_IMAGE, TASK_X2T_VIDEO, TASK_V2T) else ""
 
                     record = {
                         "request_started_at": request_started_at,
@@ -795,15 +906,19 @@ def main():
                         "cfg_text_scale": request_model_args.cfg_text_scale,
                         "prompt_file": str(prompt_file),
                         "output_dir": str(save_dir),
-                        "video_path": str(video_path) if video_path else "",
+                        "output_path": str(video_path or image_path or ""),
                         "text_result": text_result,
                     }
                     save_generation_record(record, save_dir)
 
                     if internal_task == TASK_T2V:
-                        result = (str(video_path) if video_path else None, "", f"Done: {save_dir.name}", "")
+                        result = (str(video_path) if video_path else None, None, "", f"Done: {save_dir.name}", "")
+                    elif internal_task in (TASK_T2I, TASK_IMAGE_EDIT):
+                        result = (None, str(image_path) if image_path else None, "", f"Done: {save_dir.name}", "")
+                    elif internal_task in UNDERSTANDING_TASKS:
+                        result = (None, None, text_result, f"Done: {save_dir.name}", "")
                     else:
-                        result = (None, text_result, f"Done: {save_dir.name}", "")
+                        result = (None, None, text_result, f"Done: {save_dir.name}", "")
 
                     _result_container["result"] = result
                     _result_event.set()
@@ -812,7 +927,7 @@ def main():
                 error_trace = traceback.format_exc()
                 log_rank0(f"[infer] FAILED: {e}\n{error_trace}")
                 if IS_RANK0:
-                    _result_container["result"] = (None, "", f"Failed: {e}", error_trace)
+                    _result_container["result"] = (None, None, "", f"Failed: {e}", error_trace)
                     _result_event.set()
                 dist.barrier()
 
