@@ -558,8 +558,8 @@ def main():
                 training_args=request_inference_args,
                 new_token_ids=new_token_ids,
                 dataset_config=dataset_config,
-                local_rank=GLOBAL_RANK,
-                world_size=WORLD_SIZE,
+                local_rank=0,
+                world_size=1,
             )
 
             batch = simple_custom_collate([val_dataset[0]])
