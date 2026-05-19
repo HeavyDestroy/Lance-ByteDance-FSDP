@@ -44,7 +44,7 @@ from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import Qwen2_5_VLVi
 
 from common.utils.logging import get_logger
 from common.utils.misc import AutoEncoderParams, tuple_mul
-from config.config_factory import DataArguments, InferenceArguments, ModelArguments
+from config.config_factory import DataArguments, InferenceArguments, ModelArguments, get_model_path
 from data.data_utils import add_special_tokens
 from data.dataset_base import DataConfig, simple_custom_collate
 from data.datasets_custom import ValidationDataset
@@ -105,11 +105,6 @@ TASK_T2V = "t2v"
 TASK_V2T = "v2t"
 TASK_X2T = "x2t"
 TASK_X2T_VIDEO = "x2t_video"
-
-# VAE/VIT device: kept on CPU by default to save GPU memory
-# Only moved to GPU momentarily for encode/decode steps
-VAE_DEVICE = torch.device("cpu")
-VIT_DEVICE = torch.device("cpu")
 
 TASK_CHOICES = [
     TASK_T2V,
@@ -182,70 +177,97 @@ def move_vit_to_cpu(vit_model=None):
 def init_fsdp_model(
     model_path: Path = DEFAULT_MODEL_PATH,
 ) -> tuple[Lance, Optional[WanVideoVAE], AutoEncoderParams, Qwen2Tokenizer, dict, int]:
-    """Load model, tokenizer, VAE on all ranks. VIT and VAE stay on CPU."""
+    """Load model, VIT, VAE, tokenizer on all ranks. VIT and VAE stay on CPU."""
 
-    # ── VAE (always init, keep on CPU) ──
-    log_rank0(f"[init] Initializing VAE")
+    log_rank0(f"[init] FSDP init on {WORLD_SIZE} GPUs (rank {GLOBAL_RANK}, local {LOCAL_RANK})")
+
+    # ── LLM config ──
     stage_start = time.perf_counter()
-    vae_model: WanVideoVAE = WanVideoVAE()
-    vae_config: AutoEncoderParams = deepcopy(vae_model.vae_config)
-    log_rank0(f"[init] VAE init done in {time.perf_counter() - stage_start:.2f}s")
-
-    # VAE starts on CPU (default after init)
-
-    # ── Lance model ──
     log_rank0(f"[init] Loading LLM config: {model_path / 'llm_config.json'}")
-    stage_start = time.perf_counter()
     llm_config: Qwen2Config = Qwen2Config.from_json_file(str(Path(model_path) / "llm_config.json"))
-    llm_config.layer_module = "Qwen2DecoderLayer"
+    log_rank0(f"[init] LLM config load done in {time.perf_counter() - stage_start:.2f}s")
+
+    default_model_args = ModelArguments(model_path=str(model_path), vit_type=DEFAULT_VIT_TYPE)
+    llm_config.layer_module = default_model_args.layer_module
     llm_config.qk_norm = True
     llm_config.qk_norm_und = True
     llm_config.qk_norm_gen = True
     llm_config.tie_word_embeddings = False
     llm_config.freeze_und = False
     llm_config.apply_qwen_2_5_vl_pos_emb = True
-    lance_config = LanceConfig(
-        llm_config=llm_config,
-        vae_config=vae_config,
-        vit_type=DEFAULT_VIT_TYPE,
-        training_args=InferenceArguments(visual_gen=True, visual_und=True, vae_model_type="wan"),
-    )
-    log_rank0(f"[init] LLM config load done in {time.perf_counter() - stage_start:.2f}s")
 
+    # ── LLM weights (~3B) ──
     stage_start = time.perf_counter()
     log_rank0(f"[init] Initializing LLM weights (~3B)")
-    language_model = Qwen2ForCausalLM(llm_config)
-    model = Lance(config=lance_config)
-    model.language_model = language_model
+    language_model: Qwen2ForCausalLM = Qwen2ForCausalLM(llm_config)
     log_rank0(f"[init] LLM weight init done in {time.perf_counter() - stage_start:.2f}s")
 
-    # ── VIT (init on meta device / CPU, keep on CPU) ──
-    if DEFAULT_VIT_TYPE == "qwen_2_5_vl_original":
-        stage_start = time.perf_counter()
-        log_rank0(f"[init] Loading VIT from {model_path / 'VIT'}")
-        vit_config = Qwen2_5_VLVisionConfig()
-        vit_model = Qwen2_5_VisionTransformerPretrainedModel(vit_config)
-        log_rank0(f"[init] VIT load done in {time.perf_counter() - stage_start:.2f}s")
-        model.vit_model = vit_model
+    # ── VIT ──
+    stage_start = time.perf_counter()
+    vit_path = get_model_path("vit.qwen2_5_vl")
+    log_rank0(f"[init] Loading VIT from {vit_path}")
+    vit_config = Qwen2_5_VLVisionConfig.from_pretrained(vit_path)
+    vit_model = Qwen2_5_VisionTransformerPretrainedModel(vit_config)
+    vit_weights_path = str(Path(vit_path) / "vit.safetensors")
+    if os.path.exists(vit_weights_path):
+        vit_weights = load_file(vit_weights_path)
+        vit_model.load_state_dict(vit_weights, strict=True)
+        # Free VIT weight dict after loading
+        clean_memory(vit_weights)
+    else:
+        log_rank0(f"[init] WARNING: {vit_weights_path} not found, using uninitialized VIT")
+    log_rank0(f"[init] VIT load done in {time.perf_counter() - stage_start:.2f}s")
+
+    # ── VAE (always init, keep on CPU) ──
+    stage_start = time.perf_counter()
+    log_rank0(f"[init] Initializing VAE")
+    vae_model = WanVideoVAE()
+    vae_config: AutoEncoderParams = deepcopy(vae_model.vae_config)
+    log_rank0(f"[init] VAE init done in {time.perf_counter() - stage_start:.2f}s")
+
+    # ── Lance config ──
+    config = LanceConfig(
+        visual_gen=True,
+        visual_und=True,
+        llm_config=llm_config,
+        vit_config=vit_config,
+        vae_config=vae_config,
+        latent_patch_size=[1, 1, 1],
+        max_num_frames=121,
+        max_latent_size=64,
+        vit_max_num_patch_per_side=-1,
+        connector_act="silu",
+        interpolate_pos=True,
+        timestep_shift=3.5,
+    )
+
+    # ── Create Lance model ──
+    model: Lance = Lance(
+        language_model=language_model,
+        vit_model=vit_model,
+        vit_type=DEFAULT_VIT_TYPE,
+        config=config,
+        training_args=InferenceArguments(visual_gen=True, visual_und=True, vae_model_type="wan"),
+    )
 
     stage_start = time.perf_counter()
     log_rank0(f"[init] Converting model to bf16 (CPU)")
     model.to(dtype=torch.bfloat16)
     log_rank0(f"[init] bf16 conversion done in {time.perf_counter() - stage_start:.2f}s")
 
-    # Tokenizer
+    # ── Tokenizer ──
     stage_start = time.perf_counter()
     log_rank0(f"[init] Loading tokenizer")
-    tokenizer = Qwen2Tokenizer.from_pretrained(model_path)
+    tokenizer = Qwen2Tokenizer.from_pretrained(str(model_path))
     tokenizer, new_token_ids, num_new_tokens = add_special_tokens(tokenizer)
     log_rank0(f"[init] Tokenizer done in {time.perf_counter() - stage_start:.2f}s")
 
-    # MoE init
+    # ── MoE init ──
     if True:  # copy_init_moe
         language_model.init_moe()
 
-    # Load checkpoint
-    init_from_model_path_if_needed(model, ModelArguments(model_path=model_path, vit_type=DEFAULT_VIT_TYPE))
+    # ── Load checkpoint ──
+    init_from_model_path_if_needed(model, ModelArguments(model_path=str(model_path), vit_type=DEFAULT_VIT_TYPE))
 
     if num_new_tokens > 0:
         model.language_model.resize_token_embeddings(len(tokenizer))
@@ -290,9 +312,9 @@ def init_fsdp_model(
 
     log_rank0(f"[init] {len(lm.model.layers)} decoder layers FSDP-wrapped in {time.perf_counter() - stage_start:.2f}s")
 
-    # Move remaining Lance components to GPU (these are small: connector, embedders)
+    # Move remaining Lance components to GPU (connector, embedders)
     if hasattr(model, 'vit_model') and model.vit_model is not None:
-        # VIT stays on CPU — will be moved on demand via move_vit_to_gpu()
+        # VIT stays on CPU — moved on demand
         log_rank0(f"[init] VIT kept on CPU (moved to GPU on demand)")
         model.vit_model = model.vit_model.to(device="cpu", dtype=torch.bfloat16)
     if hasattr(model, 'time_embedder'):
@@ -303,14 +325,14 @@ def init_fsdp_model(
         if hasattr(model, attr):
             getattr(model, attr).to(device=f"cuda:{DEVICE}")
 
-    # ⚡ VAE stays on CPU — moved on demand only for encode/decode
+    # VAE stays on CPU — moved on demand for encode/decode
     if hasattr(vae_model, "eval"):
         vae_model.eval()
     log_rank0(f"[init] VAE kept on CPU (moved to GPU on demand)")
 
     # Clear stale CUDA allocator cache after init
     torch.cuda.empty_cache()
-    log_rank0(f"[init] Cache cleared. All components ready on GPU (decoder sharded, VIT/VAE on CPU).")
+    log_rank0(f"[init] Cache cleared. Model ready.")
     dist.barrier()
 
     return model, vae_model, vae_config, tokenizer, new_token_ids, image_token_id
@@ -333,10 +355,7 @@ def run_inference_managed(
         # --- Generation tasks (t2v, t2i, etc.) ---
         # VIT: not needed for generation, keep on CPU
         move_vit_to_cpu(vit_model)
-
-        # VAE: needed only for decode at the end.
-        # Keep on CPU during LLM forward to save memory.
-        # validate_on_fixed_batch already handles VAE management internally.
+        # VAE: needed only for decode at end; kept on CPU during LLM forward
         move_vae_to_cpu(vae_model)
 
         validate_on_fixed_batch(
@@ -355,13 +374,9 @@ def run_inference_managed(
             save_path_gt=save_path_gt,
         )
 
-        # After inference, VAE is back on CPU (managed inside validate_on_fixed_batch)
-
     elif task in UNDERSTANDING_TASKS:
         # --- Understanding tasks (x2t, v2t) ---
-        # VIT needed for input image/video encoding
         move_vit_to_gpu(vit_model)
-        # VAE needed for input video encoding
         move_vae_to_gpu(vae_model)
 
         validate_on_fixed_batch(
@@ -380,7 +395,6 @@ def run_inference_managed(
             save_path_gt=save_path_gt,
         )
 
-        # Offload back to CPU
         move_vit_to_cpu(vit_model)
         move_vae_to_cpu(vae_model)
 
