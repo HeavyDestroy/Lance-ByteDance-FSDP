@@ -197,6 +197,13 @@ def init_fsdp_model(
     log_rank0(f"[init] Loading LLM config: {model_path / 'llm_config.json'}")
     stage_start = time.perf_counter()
     llm_config: Qwen2Config = Qwen2Config.from_json_file(str(Path(model_path) / "llm_config.json"))
+    llm_config.layer_module = "Qwen2DecoderLayer"
+    llm_config.qk_norm = True
+    llm_config.qk_norm_und = True
+    llm_config.qk_norm_gen = True
+    llm_config.tie_word_embeddings = False
+    llm_config.freeze_und = False
+    llm_config.apply_qwen_2_5_vl_pos_emb = True
     lance_config = LanceConfig(
         llm_config=llm_config,
         vae_config=vae_config,
