@@ -11,6 +11,11 @@ Architecture:
   Rank 0 runs the Gradio HTTP server.
   All ranks participate in FSDP sharded inference via NCCL broadcast sync.
   The main loop polls for work; rank 0's Gradio handler enqueues requests.
+
+Memory strategy:
+  VIT and VAE are kept on CPU by default. They are moved to GPU only when
+  needed (VAE for encode/decode steps, VIT for understanding tasks).
+  This keeps GPU memory free for the LLM forward pass (the hungriest part).
 """
 
 from __future__ import annotations
@@ -45,6 +50,8 @@ from data.dataset_base import DataConfig, simple_custom_collate
 from data.datasets_custom import ValidationDataset
 from inference_lance import (
     PROMPT_JSON_FILENAME,
+    GENERATION_TASKS,
+    UNDERSTANDING_TASKS,
     apply_inference_defaults,
     clean_memory,
     init_from_model_path_if_needed,
@@ -98,147 +105,121 @@ TASK_T2V = "t2v"
 TASK_V2T = "v2t"
 TASK_X2T = "x2t"
 TASK_X2T_VIDEO = "x2t_video"
-TASK_CHOICES = [TASK_T2V, TASK_V2T]
-VIDEO_RESOLUTION_CHOICES = ["video_192p", "video_360p", "video_480p"]
-V2T_SYSTEM_PROMPT = "Watch the video carefully and answer the question."
 
-# ─── Global state (shared between Gradio handler & main loop on rank 0) ──
+# VAE/VIT device: kept on CPU by default to save GPU memory
+# Only moved to GPU momentarily for encode/decode steps
+VAE_DEVICE = torch.device("cpu")
+VIT_DEVICE = torch.device("cpu")
+
+TASK_CHOICES = [
+    TASK_T2V,
+    TASK_V2T,
+]
+VIDEO_RESOLUTION_CHOICES = [
+    "video_480p",
+    "video_720p",
+    "video_1080p",
+]
+
+
+# ─── Shared state (rank 0 only) ───────────────────────────────────────
 _request_queue: queue.Queue = queue.Queue()
-_result_event: threading.Event = threading.Event()
 _result_container: dict = {}
+_result_event = threading.Event()
 
-# ─── Helpers ──────────────────────────────────────────────────────────
-def ensure_dirs() -> None:
-    TMP_INPUT_DIR.mkdir(parents=True, exist_ok=True)
-    RESULTS_ROOT.mkdir(parents=True, exist_ok=True)
 
-def save_generation_record(record: dict, save_dir: Path) -> None:
-    ensure_dirs()
-    run_record_path = save_dir / RUN_RECORD_FILENAME
-    with run_record_path.open("w", encoding="utf-8") as f:
-        json.dump(record, f, ensure_ascii=False, indent=2)
-    with RECORD_WRITE_LOCK:
-        with GLOBAL_RECORDS_FILE.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+# ─── VAE / VIT device management helpers ──────────────────────────────
+VAE_ON_GPU = False
+VIT_ON_GPU = False
+_vae_lock = threading.Lock()
 
-def normalize_seed(seed: int) -> int:
-    return random.randint(0, 2**31 - 1) if seed == -1 else seed
+def move_vae_to_gpu(vae_model=None):
+    """Move VAE to GPU on this rank. Call before vae_encode/vae_decode."""
+    global VAE_ON_GPU
+    if vae_model is None or VAE_ON_GPU:
+        return
+    if hasattr(vae_model, "to"):
+        log_rank0(f"[mem] Moving VAE to cuda:{DEVICE}")
+        vae_model.to(device=f"cuda:{DEVICE}")
+    VAE_ON_GPU = True
+    torch.cuda.empty_cache()
 
-def normalize_task(task: str) -> str:
-    task = (task or DEFAULT_TASK).strip().lower()
-    if task in (TASK_V2T, TASK_X2T):
-        return TASK_X2T_VIDEO
-    if task not in {TASK_T2V, TASK_X2T_VIDEO}:
-        raise ValueError(f"Unsupported task: {task}")
-    return task
+def move_vae_to_cpu(vae_model=None):
+    """Move VAE to CPU to free GPU memory. Call after vae_encode/vae_decode."""
+    global VAE_ON_GPU
+    if vae_model is None or not VAE_ON_GPU:
+        return
+    if hasattr(vae_model, "to"):
+        log_rank0(f"[mem] Moving VAE to CPU")
+        vae_model.to(device="cpu")
+    VAE_ON_GPU = False
+    torch.cuda.empty_cache()
 
-def create_request_json(task: str, prompt: str, input_video: Optional[str], question: str) -> Path:
-    ensure_dirs()
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    prompt_file = TMP_INPUT_DIR / f"{task}_{timestamp}.json"
-    if task == TASK_T2V:
-        payload = {"000000.mp4": prompt}
-    elif task == TASK_X2T_VIDEO:
-        if not input_video:
-            raise ValueError("v2t task requires an input video.")
-        payload = {
-            "000000": {
-                "interleave_array": [input_video, [V2T_SYSTEM_PROMPT, question, ""]],
-                "element_dtype_array": ["video", "text"],
-                "istarget_in_interleave": [0, 1],
-            }
-        }
-    else:
-        raise ValueError(f"Unsupported task: {task}")
-    with prompt_file.open("w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
-    return prompt_file
+def move_vit_to_gpu(vit_model=None):
+    """Move VIT to GPU. Call before x2t inference."""
+    global VIT_ON_GPU
+    if vit_model is None or VIT_ON_GPU:
+        return
+    if hasattr(vit_model, "to"):
+        log_rank0(f"[mem] Moving VIT to cuda:{DEVICE} (bf16)")
+        vit_model.to(device=f"cuda:{DEVICE}", dtype=torch.bfloat16)
+    VIT_ON_GPU = True
+    torch.cuda.empty_cache()
 
-def build_save_dir(task: str) -> Path:
-    ensure_dirs()
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return RESULTS_ROOT / f"{task}_{timestamp}_{int(time.time() * 1000) % 1000:03d}"
+def move_vit_to_cpu(vit_model=None):
+    """Move VIT to CPU. Call after x2t inference."""
+    global VIT_ON_GPU
+    if vit_model is None or not VIT_ON_GPU:
+        return
+    if hasattr(vit_model, "to"):
+        log_rank0(f"[mem] Moving VIT to CPU")
+        vit_model.to(device="cpu")
+    VIT_ON_GPU = False
+    torch.cuda.empty_cache()
 
-def find_generated_video(save_dir: Path) -> Optional[Path]:
-    videos = sorted(save_dir.glob("*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True)
-    return videos[0] if videos else None
 
-def extract_text_result(save_dir: Path) -> str:
-    pr_path = save_dir / PROMPT_JSON_FILENAME
-    if not pr_path.exists():
-        return ""
-    data = json.loads(pr_path.read_text())
-    if not data:
-        return ""
-    first_val = next(iter(data.values()))
-    return first_val if isinstance(first_val, str) else json.dumps(first_val, ensure_ascii=False)
+# ─── Model init (all ranks) ───────────────────────────────────────────
+def init_fsdp_model(
+    model_path: Path = DEFAULT_MODEL_PATH,
+) -> tuple[Lance, Optional[WanVideoVAE], AutoEncoderParams, Qwen2Tokenizer, dict, int]:
+    """Load model, tokenizer, VAE on all ranks. VIT and VAE stay on CPU."""
 
-# ─── FSDP Model Initialization (all ranks) ────────────────────────────
-def init_fsdp_model():
-    log_rank0(f"[init] FSDP init on {WORLD_SIZE} GPUs (rank {GLOBAL_RANK}, local {LOCAL_RANK})")
-
-    model_path = str(DEFAULT_MODEL_PATH) if DEFAULT_MODEL_PATH.exists() else ""
+    # ── VAE (always init, keep on CPU) ──
+    log_rank0(f"[init] Initializing VAE")
     stage_start = time.perf_counter()
-    log_rank0(f"[init] Loading LLM config: {Path(model_path) / 'llm_config.json'}")
-    llm_config: Qwen2Config = Qwen2Config.from_json_file(str(Path(model_path) / "llm_config.json"))
-    log_rank0(f"[init] LLM config load done in {time.perf_counter() - stage_start:.2f}s")
+    vae_model: WanVideoVAE = WanVideoVAE()
+    vae_config: AutoEncoderParams = deepcopy(vae_model.vae_config)
+    log_rank0(f"[init] VAE init done in {time.perf_counter() - stage_start:.2f}s")
 
-    default_model_args = ModelArguments(model_path=model_path, vit_type=DEFAULT_VIT_TYPE)
-    llm_config.layer_module = default_model_args.layer_module
-    llm_config.qk_norm = True
-    llm_config.qk_norm_und = True
-    llm_config.qk_norm_gen = True
-    llm_config.tie_word_embeddings = False
-    llm_config.freeze_und = False
-    llm_config.apply_qwen_2_5_vl_pos_emb = True
+    # VAE starts on CPU (default after init)
+
+    # ── Lance model ──
+    log_rank0(f"[init] Loading LLM config: {model_path / 'llm_config.json'}")
+    stage_start = time.perf_counter()
+    llm_config = Qwen2Config.from_pretrained(str(model_path))
+    lance_config = LanceConfig(
+        llm_config=llm_config,
+        vae_config=vae_config,
+        vit_type=DEFAULT_VIT_TYPE,
+        training_args=InferenceArguments(visual_gen=True, visual_und=True, vae_model_type="wan"),
+    )
+    log_rank0(f"[init] LLM config load done in {time.perf_counter() - stage_start:.2f}s")
 
     stage_start = time.perf_counter()
     log_rank0(f"[init] Initializing LLM weights (~3B)")
-    language_model: Qwen2ForCausalLM = Qwen2ForCausalLM(llm_config)
+    language_model = Qwen2ForCausalLM(llm_config)
+    model = Lance(config=lance_config)
+    model.language_model = language_model
     log_rank0(f"[init] LLM weight init done in {time.perf_counter() - stage_start:.2f}s")
 
-    # Resolve VIT path via path_default.yaml
-    from config.config_factory import get_model_path
-    vit_path = get_model_path("vit.qwen2_5_vl")
-    stage_start = time.perf_counter()
-    log_rank0(f"[init] Loading VIT from {vit_path}")
-    vit_config = Qwen2_5_VLVisionConfig.from_pretrained(vit_path)
-    vit_model = Qwen2_5_VisionTransformerPretrainedModel(vit_config)
-    vit_weights = load_file(str(Path(vit_path) / "vit.safetensors"))
-    vit_model.load_state_dict(vit_weights, strict=True)
-    log_rank0(f"[init] VIT load done in {time.perf_counter() - stage_start:.2f}s")
-    clean_memory(vit_weights)
-
-    # VAE
-    stage_start = time.perf_counter()
-    log_rank0(f"[init] Initializing VAE")
-    vae_model = WanVideoVAE()
-    vae_config = deepcopy(vae_model.vae_config)
-    log_rank0(f"[init] VAE init done in {time.perf_counter() - stage_start:.2f}s")
-
-    # Lance config
-    config = LanceConfig(
-        visual_gen=True,
-        visual_und=True,
-        llm_config=llm_config,
-        vit_config=vit_config,
-        vae_config=vae_config,
-        latent_patch_size=[1, 1, 1],
-        max_num_frames=121,
-        max_latent_size=64,
-        vit_max_num_patch_per_side=-1,
-        connector_act="silu",
-        interpolate_pos=True,
-        timestep_shift=3.5,
-    )
-
-    model: Lance = Lance(
-        language_model=language_model,
-        vit_model=vit_model,
-        vit_type=DEFAULT_VIT_TYPE,
-        config=config,
-        training_args=InferenceArguments(visual_gen=True, visual_und=True, vae_model_type="wan"),
-    )
+    # ── VIT (init on meta device / CPU, keep on CPU) ──
+    if DEFAULT_VIT_TYPE == "qwen_2_5_vl_original":
+        stage_start = time.perf_counter()
+        log_rank0(f"[init] Loading VIT from {model_path / 'VIT'}")
+        vit_config = Qwen2_5_VLVisionConfig()
+        vit_model = Qwen2_5_VisionTransformerPretrainedModel(vit_config)
+        log_rank0(f"[init] VIT load done in {time.perf_counter() - stage_start:.2f}s")
+        model.vit_model = vit_model
 
     stage_start = time.perf_counter()
     log_rank0(f"[init] Converting model to bf16 (CPU)")
@@ -283,7 +264,7 @@ def init_fsdp_model():
 
     lm = model.language_model
 
-    # Move non-layer components to GPU (stay full)
+    # Move non-layer components to GPU (stay full on each rank)
     lm.lm_head = lm.lm_head.to(device=f"cuda:{DEVICE}", dtype=torch.bfloat16)
     lm.model.embed_tokens = lm.model.embed_tokens.to(device=f"cuda:{DEVICE}", dtype=torch.bfloat16)
     lm.model.norm = lm.model.norm.to(device=f"cuda:{DEVICE}", dtype=torch.bfloat16)
@@ -302,9 +283,11 @@ def init_fsdp_model():
 
     log_rank0(f"[init] {len(lm.model.layers)} decoder layers FSDP-wrapped in {time.perf_counter() - stage_start:.2f}s")
 
-    # Move remaining Lance components to GPU
+    # Move remaining Lance components to GPU (these are small: connector, embedders)
     if hasattr(model, 'vit_model') and model.vit_model is not None:
-        model.vit_model = model.vit_model.to(device=f"cuda:{DEVICE}", dtype=torch.bfloat16)
+        # VIT stays on CPU — will be moved on demand via move_vit_to_gpu()
+        log_rank0(f"[init] VIT kept on CPU (moved to GPU on demand)")
+        model.vit_model = model.vit_model.to(device="cpu", dtype=torch.bfloat16)
     if hasattr(model, 'time_embedder'):
         model.time_embedder = model.time_embedder.to(device=f"cuda:{DEVICE}")
     if hasattr(model, 'connector') and model.connector is not None:
@@ -313,16 +296,181 @@ def init_fsdp_model():
         if hasattr(model, attr):
             getattr(model, attr).to(device=f"cuda:{DEVICE}")
 
-    # VAE to GPU
+    # ⚡ VAE stays on CPU — moved on demand only for encode/decode
     if hasattr(vae_model, "eval"):
         vae_model.eval()
-    if hasattr(vae_model, "to"):
-        vae_model.to(device=f"cuda:{DEVICE}")
+    log_rank0(f"[init] VAE kept on CPU (moved to GPU on demand)")
 
-    log_rank0(f"[init] All components on GPU. Model ready.")
+    # Clear stale CUDA allocator cache after init
+    torch.cuda.empty_cache()
+    log_rank0(f"[init] Cache cleared. All components ready on GPU (decoder sharded, VIT/VAE on CPU).")
     dist.barrier()
 
     return model, vae_model, vae_config, tokenizer, new_token_ids, image_token_id
+
+
+# ─── Wrapper: validate_on_fixed_batch with VAE/VIT management ─────────
+def run_inference_managed(
+    fsdp_model: Lance,
+    vae_model: Optional[WanVideoVAE],
+    vit_model,
+    tokenizer, batch, training_args, model_args, inference_args,
+    new_token_ids, image_token_id, device, save_path_gen,
+    save_source_video=False, save_path_gt="",
+) -> None:
+    """Wrapper around validate_on_fixed_batch with VAE/VIT GPU management."""
+
+    task = inference_args.task
+
+    if task in GENERATION_TASKS:
+        # --- Generation tasks (t2v, t2i, etc.) ---
+        # VIT: not needed for generation, keep on CPU
+        move_vit_to_cpu(vit_model)
+
+        # VAE: needed only for decode at the end.
+        # Keep on CPU during LLM forward to save memory.
+        # validate_on_fixed_batch already handles VAE management internally.
+        move_vae_to_cpu(vae_model)
+
+        validate_on_fixed_batch(
+            fsdp_model=fsdp_model,
+            vae_model=vae_model,
+            tokenizer=tokenizer,
+            val_data_cpu=batch,
+            training_args=training_args,
+            model_args=model_args,
+            inference_args=inference_args,
+            new_token_ids=new_token_ids,
+            image_token_id=image_token_id,
+            device=device,
+            save_source_video=save_source_video,
+            save_path_gen=save_path_gen,
+            save_path_gt=save_path_gt,
+        )
+
+        # After inference, VAE is back on CPU (managed inside validate_on_fixed_batch)
+
+    elif task in UNDERSTANDING_TASKS:
+        # --- Understanding tasks (x2t, v2t) ---
+        # VIT needed for input image/video encoding
+        move_vit_to_gpu(vit_model)
+        # VAE needed for input video encoding
+        move_vae_to_gpu(vae_model)
+
+        validate_on_fixed_batch(
+            fsdp_model=fsdp_model,
+            vae_model=vae_model,
+            tokenizer=tokenizer,
+            val_data_cpu=batch,
+            training_args=training_args,
+            model_args=model_args,
+            inference_args=inference_args,
+            new_token_ids=new_token_ids,
+            image_token_id=image_token_id,
+            device=device,
+            save_source_video=save_source_video,
+            save_path_gen=save_path_gen,
+            save_path_gt=save_path_gt,
+        )
+
+        # Offload back to CPU
+        move_vit_to_cpu(vit_model)
+        move_vae_to_cpu(vae_model)
+
+    clean_memory()
+
+
+# ─── Utility functions ────────────────────────────────────────────────
+def ensure_dirs():
+    for d in [GRADIO_TMP_ROOT, TMP_INPUT_DIR, RESULTS_ROOT]:
+        d.mkdir(parents=True, exist_ok=True)
+
+
+def normalize_task(task: str) -> str:
+    task = (task or "").strip().lower()
+    if task in ("t2v", "text2video", "text-to-video"):
+        return TASK_T2V
+    if task in ("v2t", "video2text", "video-to-text"):
+        return TASK_V2T
+    return TASK_T2V
+
+
+def normalize_seed(seed: int) -> int:
+    if seed < 0:
+        return random.randint(0, 2**31 - 1)
+    return seed
+
+
+def build_save_dir(task: str) -> Path:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+    return RESULTS_ROOT / f"{task}_{timestamp}"
+
+
+def create_request_json(task, prompt, input_video, question) -> Path:
+    """Write a one-sample prompt JSON file for the dataset loader."""
+    import yaml
+    data = {
+        TASK_T2V: {
+            "dataset_type": "jsonl",
+            "jsonl_files": [str(TMP_INPUT_DIR / "t2v_prompt.jsonl")],
+        },
+        TASK_V2T: {
+            "dataset_type": "jsonl",
+            "jsonl_files": [str(TMP_INPUT_DIR / "v2t_prompt.jsonl")],
+        },
+    }
+
+    os.makedirs(TMP_INPUT_DIR, exist_ok=True)
+    yaml_path = TMP_INPUT_DIR / f"{task}_config.yaml"
+
+    with open(yaml_path, "w") as f:
+        yaml.dump(data.get(task, data[TASK_T2V]), f, default_flow_style=False)
+
+    if task == TASK_T2V:
+        jsonl_path = TMP_INPUT_DIR / "t2v_prompt.jsonl"
+        with open(jsonl_path, "w") as f:
+            json.dump({"prompt": prompt.strip()}, f)
+            f.write("\n")
+    elif task == TASK_V2T:
+        jsonl_path = TMP_INPUT_DIR / "v2t_prompt.jsonl"
+        entry = {"prompt": prompt.strip()}
+        if input_video:
+            entry["video_path"] = input_video
+        if question:
+            entry["question"] = question
+        with open(jsonl_path, "w") as f:
+            json.dump(entry, f)
+            f.write("\n")
+
+    return yaml_path
+
+
+def save_generation_record(record: dict, save_dir: Path):
+    with RECORD_WRITE_LOCK:
+        with open(save_dir / RUN_RECORD_FILENAME, "w") as f:
+            json.dump(record, f, ensure_ascii=False, indent=2)
+        with open(GLOBAL_RECORDS_FILE, "a") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def find_generated_video(save_dir: Path) -> Optional[str]:
+    for f in sorted(save_dir.iterdir()):
+        if f.suffix in (".mp4", ".gif", ".png", ".jpg"):
+            return str(f.resolve())
+    return None
+
+
+def extract_text_result(save_dir: Path) -> str:
+    json_path = save_dir / "result.json"
+    if json_path.exists():
+        with open(json_path) as f:
+            data = json.load(f)
+            if isinstance(data, list) and len(data) > 0:
+                return data[0].get("generated_text", str(data[0]))
+            if isinstance(data, dict):
+                return data.get("generated_text", str(data))
+    return ""
+
 
 # ─── Gradio UI (rank 0 only) ──────────────────────────────────────────
 def run_task_handler(
@@ -346,11 +494,14 @@ def run_task_handler(
     _result_event.clear()
     return _result_container.pop("result", (None, "", "No result", ""))
 
+
 def build_status_markdown() -> str:
     return (
         f"**Status**  GPUs: `{WORLD_SIZE}`  |  "
-        f"FSDP: `FULL_SHARD`  |  Rank 0 serves UI"
+        f"FSDP: `FULL_SHARD`  |  Rank 0 serves UI  |  "
+        f"VAE/VIT: `on-demand`"
     )
+
 
 def update_task_ui(task: str):
     task = (task or DEFAULT_TASK).strip().lower()
@@ -373,6 +524,7 @@ def update_task_ui(task: str):
         gr.update(visible=False),
         gr.update(value=""),
     )
+
 
 def build_demo() -> gr.Blocks:
     with gr.Blocks(title="Lance T2V/V2T (FSDP Dual-GPU)") as demo:
@@ -426,6 +578,7 @@ def build_demo() -> gr.Blocks:
         )
 
     return demo
+
 
 # ─── Main FSDP loop (all ranks) ───────────────────────────────────────
 def main():
@@ -572,11 +725,13 @@ def main():
                 log_rank0(f"[infer] Starting {internal_task} | GPU={DEVICE} | "
                           f"size={request_inference_args.video_height}x{request_inference_args.video_width}")
 
-                validate_on_fixed_batch(
+                # Use the managed wrapper that handles VAE/VIT GPU placement
+                run_inference_managed(
                     fsdp_model=model,
                     vae_model=vae_model,
+                    vit_model=getattr(model, 'vit_model', None),
                     tokenizer=tokenizer,
-                    val_data_cpu=batch,
+                    batch=batch,
                     training_args=request_inference_args,
                     model_args=request_model_args,
                     inference_args=request_inference_args,
@@ -655,6 +810,7 @@ def main():
         else:
             # No work — brief sleep
             time.sleep(0.2)
+
 
 if __name__ == "__main__":
     main()

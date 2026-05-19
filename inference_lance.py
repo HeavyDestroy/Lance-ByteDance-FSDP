@@ -263,9 +263,15 @@ def validate_on_fixed_batch(
     # fsdp_model = fsdp_model.to(device=device, dtype=torch.bfloat16)
 
     with torch.no_grad(), torch.amp.autocast("cuda", enabled=True, dtype=torch.bfloat16):
-        # Compute padded_latent.
+        # Compute padded_latent — move VAE to GPU on demand, then back to CPU.
+        _vae_was_on_cpu = vae_model is not None and next(vae_model.parameters()).device.type == "cpu"
         if "padded_videos" in val_data.keys():
+            if _vae_was_on_cpu and vae_model is not None:
+                vae_model.to(device=f"cuda:{device}")
             val_data["padded_latent"] = make_padded_latent(val_data["padded_videos"], val_data["vae_data_mode"], vae_model)
+            if _vae_was_on_cpu and vae_model is not None:
+                vae_model.to(device="cpu")
+                torch.cuda.empty_cache()
 
         # -------------------- Generation branch --------------------
         if inference_args.task in GENERATION_TASKS:
@@ -321,8 +327,15 @@ def validate_on_fixed_batch(
                     target_latents = latent
 
                 v_list = []
+                # Move VAE to GPU for decode (it may be on CPU to save memory)
+                _vae_on_cpu_decode = vae_model is not None and next(vae_model.parameters()).device.type == "cpu"
+                if _vae_on_cpu_decode:
+                    vae_model.to(device=f"cuda:{device}")
                 for latent_ in target_latents:
                     v_list.append(vae_model.vae_decode([latent_])[0])
+                if _vae_on_cpu_decode:
+                    vae_model.to(device="cpu")
+                    torch.cuda.empty_cache()
 
                 save_item_name = f"{index:06d}" if isinstance(index, int) else index
                 v_thwc = decode_video_tensor(v_list, save_path=save_path_gen, save_half=False, save_item_name=save_item_name)
